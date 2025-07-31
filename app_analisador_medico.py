@@ -1,19 +1,26 @@
+
 import streamlit as st
 import PyPDF2
 import spacy
 import re
+import os
 
-# --- Carregar o modelo spaCy para processamento de linguagem ---
-# Preferimos o modelo em português, mas temos um fallback para inglês.
-try:
-    nlp = spacy.load("pt_core_news_sm")
-except OSError:
-    st.warning("Modelo spaCy para português não encontrado. Tentando carregar modelo em inglês.")
+# --- Verificação e Download do Modelo spaCy ---
+# Esta é a parte crucial que corrige o erro de inicialização.
+# O aplicativo irá baixar o modelo pt_core_news_sm apenas se ele não estiver presente.
+@st.cache_resource
+def load_spacy_model():
+    model_name = "pt_core_news_sm"
     try:
-        nlp = spacy.load("en_core_web_sm")
+        # Tenta carregar o modelo. Se não existir, a exceção é capturada.
+        nlp = spacy.load(model_name)
     except OSError:
-        st.error("Nenhum modelo spaCy encontrado. Por favor, execute 'python -m spacy download pt_core_news_sm' ou 'en_core_web_sm' no seu terminal.")
-        st.stop() # Interrompe a execução se nenhum modelo puder ser carregado
+        with st.spinner(f"Baixando modelo de linguagem '{model_name}' (pode levar alguns minutos)..."):
+            spacy.cli.download(model_name)
+            nlp = spacy.load(model_name)
+    return nlp
+
+nlp = load_spacy_model()
 
 
 # --- Configurações da Página do Streamlit ---
@@ -25,7 +32,7 @@ st.set_page_config(
 )
 
 # --- Função para extrair texto de PDF ---
-@st.cache_data # Cache para não reprocessar o mesmo PDF
+@st.cache_data
 def extract_text_from_pdf(pdf_file):
     """Extrai texto de um arquivo PDF carregado."""
     text = ""
@@ -34,9 +41,9 @@ def extract_text_from_pdf(pdf_file):
         for page in pdf_reader.pages:
             page_text = page.extract_text()
             if page_text:
-                text += page_text + "\n" # Adiciona quebra de linha entre páginas
+                text += page_text + "\n"
     except Exception as e:
-        st.error(f"Erro ao extrair texto do PDF: {e}. Verifique se o PDF está legível.")
+        st.error(f"Erro ao extrair texto do PDF: {e}. Verifique se o PDF está legível e não é uma imagem escaneada.")
         return ""
     return text
 
@@ -47,7 +54,7 @@ def process_medical_text(text):
     A lógica é baseada em padrões de texto e palavras-chave.
     """
     extracted_info = {
-        "Palavras-chave de Reconhecimento": set(), # Usamos set para garantir unicidade
+        "Palavras-chave de Reconhecimento": set(),
         "Diagnóstico Possível": "Não identificado claramente",
         "Exames Padrão Ouro": set(),
         "Exames Complementares": set(),
@@ -55,10 +62,9 @@ def process_medical_text(text):
         "Diagnóstico Diferencial": set()
     }
 
-    doc = nlp(text.lower()) # Processa o texto em minúsculas para facilitar a correspondência
+    doc = nlp(text.lower())
 
     # --- 1. Palavras-chave de Reconhecimento ---
-    # Termos comuns em laudos que indicam achados ou queixas.
     keywords_recognition_list = [
         "sintoma", "sintomas", "achado", "achados", "clínico", "clínica",
         "história", "quadro", "paciente", "queixa", "queixas", "dor", "febre",
@@ -69,33 +75,19 @@ def process_medical_text(text):
         if re.search(r'\b' + re.escape(keyword) + r'\b', text, re.IGNORECASE):
             extracted_info["Palavras-chave de Reconhecimento"].add(keyword)
 
-
     # --- 2. Diagnóstico Possível ---
-    # Tentativa de capturar o diagnóstico principal.
-    # Padrões comuns: "diagnóstico de", "compatível com", "sugestivo de", "hipótese diagnóstica"
     match_diag = re.search(r'(?:diagnóstico de|compatível com|sugestivo de|hipótese diagnóstica)[:\s]*([\w\s,-]+?)(?:\.|\n|e\s|\bpara\b|em\s|\bcom\b|\bsem\b|$)', text, re.IGNORECASE)
     if match_diag:
-        # Pega o grupo capturado e limpa espaços extras
         diagnosis = match_diag.group(1).strip()
-        # Remove caracteres indesejados no final
         diagnosis = re.sub(r'[,.;:\s]+$', '', diagnosis)
-        # Limita o tamanho da string do diagnóstico para evitar capturas muito longas
-        if len(diagnosis) > 100:
-            diagnosis = diagnosis[:100] + "..."
+        if len(diagnosis) > 100: diagnosis = diagnosis[:100] + "..."
         extracted_info["Diagnóstico Possível"] = diagnosis.capitalize()
     else:
-        # Fallback: tentar identificar entidades médicas gerais se o padrão não for encontrado
-        # Isso é limitado, mas pode pegar nomes de doenças se o modelo do spaCy as reconhecer.
-        # Estamos procurando por "entidades nomeadas" que podem ser doenças ou problemas.
         potential_diagnoses = [ent.text for ent in doc.ents if ent.label_ in ["DISEASE", "MEDICAL_CONDITION", "SYMPTOM", "ORG"]]
         if potential_diagnoses:
-            # Pega os 2-3 primeiros termos mais prováveis ou frequentes como um diagnóstico possível
-            # Poderíamos adicionar contagem de frequência aqui para maior relevância
             extracted_info["Diagnóstico Possível"] = ", ".join(list(set(potential_diagnoses[:3]))).capitalize()
 
-
     # --- 3. Exames Padrão Ouro e 4. Exames Complementares ---
-    # Uma lista mais abrangente de termos de exames.
     exam_keywords_list = [
         "ressonância magnética", "tomografia computadorizada", "raio-x", "ultrassonografia",
         "exame de sangue", "hemograma", "urina", "cultura", "biópsia", "endoscopia",
@@ -104,21 +96,15 @@ def process_medical_text(text):
         "colesterol", "triglicerídeos", "creatinina", "ureia", "ecocardiograma",
         "teste de função pulmonar", "espirometria", "tomografia por emissão de pósitrons", "PET-CT"
     ]
-
     for exam in exam_keywords_list:
-        # Verifica se o exame é mencionado no texto
         if re.search(r'\b' + re.escape(exam) + r'\b', text, re.IGNORECASE):
-            # Tenta inferir "padrão ouro" se a frase estiver próxima
-            # Esta é uma heuristicia e pode não ser 100% precisa.
             context_around_exam = text[max(0, text.lower().find(exam.lower()) - 50):min(len(text), text.lower().find(exam.lower()) + len(exam) + 50)]
             if re.search(r'padrão ouro|gold standard', context_around_exam, re.IGNORECASE):
                 extracted_info["Exames Padrão Ouro"].add(exam.capitalize())
             else:
                 extracted_info["Exames Complementares"].add(exam.capitalize())
 
-
     # --- 5. Tratamento Sugerido ---
-    # Termos comuns que indicam tratamento.
     treatment_keywords_list = [
         "tratamento", "terapia", "medicação", "medicamento", "cirurgia", "intervenção",
         "aconselhamento", "reabilitação", "dose", "prescrição", "conduta", "indicado",
@@ -126,38 +112,30 @@ def process_medical_text(text):
         "radioterapia", "dieta", "repouso"
     ]
     found_treatments = []
-    # Procurar sentenças que contenham termos de tratamento e tentar extrair a sentença completa
     for sent in doc.sents:
         if any(re.search(r'\b' + re.escape(keyword) + r'\b', sent.text, re.IGNORECASE) for keyword in treatment_keywords_list):
             found_treatments.append(sent.text.strip())
-            if len(found_treatments) >= 2: # Pegar no máximo 2 sentenças como exemplo
-                break
+            if len(found_treatments) >= 2: break
     if found_treatments:
         extracted_info["Tratamento Sugerido"] = " ".join(found_treatments).capitalize()
     else:
-        # Fallback: tentar encontrar termos de tratamento isolados
         for keyword in treatment_keywords_list:
             if re.search(r'\b' + re.escape(keyword) + r'\b', text, re.IGNORECASE):
                 extracted_info["Tratamento Sugerido"] = keyword.capitalize() + " (mencionado)"
-                break # Pega o primeiro encontrado
-
+                break
 
     # --- 6. Diagnóstico Diferencial ---
-    # Termos que indicam outras condições a serem consideradas.
     differential_keywords_list = ["diagnóstico diferencial", "DD", "descartar", "excluir", "considerar a possibilidade de"]
     found_diff_diag = []
     for keyword in differential_keywords_list:
         if re.search(r'\b' + re.escape(keyword) + r'\b', text, re.IGNORECASE):
-            # Tenta capturar a frase após a palavra-chave do DD
             match_dd = re.search(r'(' + re.escape(keyword) + r'[:\s]*(.*?)(?:\.|\n|e\s|\bcom\b|$))', text, re.IGNORECASE)
             if match_dd:
                 diff_diag = match_dd.group(2).strip()
                 diff_diag = re.sub(r'[,.;:\s]+$', '', diff_diag)
-                if len(diff_diag) > 100:
-                    diff_diag = diff_diag[:100] + "..."
+                if len(diff_diag) > 100: diff_diag = diff_diag[:100] + "..."
                 found_diff_diag.append(diff_diag.capitalize())
             else:
-                # Se não encontrar um padrão específico, adiciona a própria palavra-chave
                 found_diff_diag.append(keyword.capitalize())
 
     if found_diff_diag:
@@ -165,14 +143,13 @@ def process_medical_text(text):
     else:
         extracted_info["Diagnóstico Diferencial"].add("Não identificado claramente (requer análise manual)")
 
-
-    # Converter sets para listas para exibição
     extracted_info["Palavras-chave de Reconhecimento"] = list(extracted_info["Palavras-chave de Reconhecimento"])
     extracted_info["Exames Padrão Ouro"] = list(extracted_info["Exames Padrão Ouro"])
     extracted_info["Exames Complementares"] = list(extracted_info["Exames Complementares"])
     extracted_info["Diagnóstico Diferencial"] = list(extracted_info["Diagnóstico Diferencial"])
 
     return extracted_info
+
 
 # --- Título e Descrição da Interface ---
 st.title("📄 Analisador Inteligente de Laudos Médicos")
@@ -206,7 +183,6 @@ if uploaded_file is not None:
             st.markdown("---")
             st.subheader("3. Resultados da Análise")
 
-            # --- Exibição dos Resultados ---
             st.markdown("### 🔍 Palavras-chave de Reconhecimento")
             if analysis_results["Palavras-chave de Reconhecimento"]:
                 st.info(", ".join(analysis_results["Palavras-chave de Reconhecimento"]))
